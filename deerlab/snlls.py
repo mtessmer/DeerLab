@@ -17,8 +17,8 @@ from deerlab.classes import UncertQuant, FitResult
 
 def snlls(y, Amodel, par0, lb=None, ub=None, lbl=None, ubl=None, nnlsSolver='cvx', reg='auto', weights=1,
           regtype='tikhonov', regparam='aic', multistart=1, regorder=2, alphareopt=1e-3,
-          nonlin_tol=1e-9, nonlin_maxiter=1e8, lin_tol=1e-15, lin_maxiter=1e4, huberparam=1.35,
-          uqanalysis=True):
+          nonlin_tol=1e-9, nonlin_maxiter=1e8, lin_tol=1e-15, lin_maxiter=1e4, huberparam=1.35,xtol=1e-3,
+          uqanalysis=True,identify=None):
     r""" Separable Non-linear Least Squares Solver
 
     Parameters
@@ -114,18 +114,18 @@ def snlls(y, Amodel, par0, lb=None, ub=None, lbl=None, ubl=None, nnlsSolver='cvx
     Returns
     -------
     :ref:`FitResult` with the following fields defined:
-    nlin : ndarray
+    nonlin : ndarray
         Fitted non-linear parameters
     lin : ndarray
         Fitted linear parameters
-    paramuq : :ref:`UncertQuant`
+    uncertainty : :ref:`UncertQuant`
         Uncertainty quantification of the joined parameter
         set (linear + non-linear parameters). The confidence intervals
         of the individual subsets can be requested via:
 
-        * ``paramuq.ci(n)``           - n%-CI of the full parameter set
-        * ``paramuq.ci(n,'lin')``     - n%-CI of the linear parameter set
-        * ``paramuq.ci(n,'nonlin')``  - n%-CI of the non-linear parameter set
+        * ``uncertainty.ci(n)``           - n%-CI of the full parameter set
+        * ``uncertainty.ci(n,'lin')``     - n%-CI of the linear parameter set
+        * ``uncertainty.ci(n,'nonlin')``  - n%-CI of the non-linear parameter set
     regparam : scalar
         Regularization parameter value used for the regularization of the linear parameters.
     plot : callable
@@ -247,7 +247,10 @@ def snlls(y, Amodel, par0, lb=None, ub=None, lbl=None, ubl=None, nnlsSolver='cvx
 
     if includePenalty:
         # Use an arbitrary axis
-        ax = np.arange(1, Nlin+1)
+        if identify is not None:
+            ax,metric,beta = identify
+        else:
+            ax = np.arange(1, Nlin+1)
         # Get regularization operator
         regorder = np.minimum(Nlin-1, regorder)
         L = dl.regoperator(ax, regorder)
@@ -329,11 +332,29 @@ def snlls(y, Amodel, par0, lb=None, ub=None, lbl=None, ubl=None, nnlsSolver='cvx
         yfit = A@linfit
         # Compute residual vector
         res = weights*(yfit - y)
+
+
         if includePenalty:
-            penalty = alpha*L@linfit
             # Augmented residual
-            res = np.concatenate((res, penalty))
             res, _ = _augment(res, [], regtype, alpha, L, linfit, huberparam, Nnonlin)
+        
+
+        if identify is not None:
+            r,metric,beta = identify
+            dr = np.mean(np.diff(r))
+            rmean = np.trapz(linfit*r,r)
+            if metric=='mean': 
+                metric_vect = linfit*r*dr
+            elif metric=='variance':
+                metric_vect = (linfit*(r - rmean)**2*dr)
+            elif metric=='efficiency':
+                metric_vect = (linfit*(r - rmean)**2*dr)/rmean**2
+            elif metric=='qcod': 
+                metric_vect = beta*np.sqrt(np.atleast_1d((_pctile(linfit,75,r) - _pctile(linfit,25,r))/(_pctile(linfit,75,r) + _pctile(linfit,25,r))))
+            else: raise KeyError('{} penalty type not found.'.format(metric))
+            res = np.concatenate((res,beta*np.sqrt(metric_vect)))
+
+
 
         return res
     #===========================================================================
@@ -350,7 +371,7 @@ def snlls(y, Amodel, par0, lb=None, ub=None, lbl=None, ubl=None, nnlsSolver='cvx
     # Multi-start global optimization
     for par0 in multiStartPar0:
         # Run the non-linear solver
-        sol = least_squares(ResidualsFcn, par0, bounds=(lb, ub), max_nfev=int(nonlin_maxiter), ftol=nonlin_tol)
+        sol = least_squares(ResidualsFcn, par0, bounds=(lb, ub), max_nfev=int(nonlin_maxiter),x_scale='jac', ftol=nonlin_tol,verbose=0,xtol=xtol)
         nonlinfits.append(sol.x)
         linfits.append(linfit)
         fvals.append(sol.cost)
@@ -379,9 +400,26 @@ def snlls(y, Amodel, par0, lb=None, ub=None, lbl=None, ubl=None, nnlsSolver='cvx
         # Augment the residual and Jacobian with the regularization penalty on the linear parameters
         res, J = _augment(res, J, regtype, regparam_prev, L, linfit, huberparam, Nnonlin)
 
+        if identify is not None:
+            r,metric,beta = identify
+            res = ResidualsFcn(nonlinfit)
+            Jnonlin = Jacobian(lambda p: ResidualsFcn(p),nonlinfit,lb,ub)
+            dr = np.mean(np.diff(r))
+            if metric=='mean': 
+                varfcn = lambda plin: beta*np.sqrt(plin*r*dr)
+            elif metric=='variance':
+                varfcn = lambda plin: beta*np.sqrt(plin*(r - np.trapz(plin*r,r))**2*dr)
+            elif metric=='efficiency':
+                varfcn = lambda plin: beta*np.sqrt(plin*(r - np.trapz(plin*r,r))**2*dr)/np.trapz(plin*r,r)
+            elif metric=='qcod':
+                varfcn = lambda plin: beta*np.sqrt(np.atleast_1d((_pctile(plin,75,r) - _pctile(plin,25,r))/(_pctile(plin,75,r) + _pctile(plin,25,r))))
+            Jvar =Jacobian(varfcn,linfit,lb=np.zeros_like(linfit),ub=np.full_like(linfit,np.inf))
+            Jlin = np.concatenate((Afit, alpha*L,Jvar))
+            J = np.concatenate((Jnonlin,Jlin),1)
+
         # Calculate the heteroscedasticity consistent covariance matrix
         covmatrix = hccm(J, res, 'HC1')
-        
+
         # Get combined parameter sets and boundaries
         parfit = np.concatenate((nonlinfit, linfit))
         lbs = np.concatenate((lb, lbl))
@@ -481,3 +519,11 @@ def _plot(subsets,y,yfit):
     return axs
 # ===========================================================================================
 
+# Percentile function
+# ===========================================================================================
+def _pctile(P,p,r):
+    cdf = np.cumsum(P/np.sum(P))
+    cdf, index = np.lib.arraysetops.unique(cdf,return_index=True)
+    rpctile = np.interp(p/100,cdf,r[index])
+    return rpctile
+# ===========================================================================================
